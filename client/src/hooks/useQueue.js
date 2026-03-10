@@ -1,33 +1,3 @@
-/**
- * useQueue.js — Duo-fy Shared Queue Hook
- *
- * Manages the synchronized queue for a room.
- * Both users see the same queue; all mutations are broadcast through the server.
- *
- * Usage in Room.jsx:
- *
- *   const { queue, addToQueue, removeFromQueue } = useQueue({ roomId });
- *
- *   // In SearchPanel, on track select:
- *   addToQueue(track);   // → server → queue-updated → both clients
- *
- *   // In QueuePanel, on remove:
- *   removeFromQueue(index);
- *
- * The `track` object shape expected by the server:
- * {
- *   id       : string   — Spotify track ID
- *   uri      : string   — spotify:track:<id>
- *   name     : string
- *   artists  : string   — comma-joined artist names
- *   albumArt : string   — album cover URL
- *   durationMs: number
- * }
- *
- * Helper: normalizeSpotifyTrack(spotifyItem) converts a raw Spotify API
- * track object into the shape above.
- */
-
 import { useEffect, useRef, useState, useCallback } from "react";
 import socketService from "../socket";
 
