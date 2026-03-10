@@ -1,13 +1,5 @@
-/* ============================================================
-   ROOM.CSS — "Lovers Mode"
-   Palette: Dark Wine × Rose Pink × Lavender × Mint
-   Layout: 3-col desktop (Queue | Player | Search)
-           Tab-switched panels on mobile
-   ============================================================ */
-
 @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600;700&family=DM+Sans:wght@300;400;500;600;700&display=swap');
 
-/* ── Design tokens ─────────────────────────────────────────── */
 :root {
   --wine: #14071F;
   --plum: #2A0E3F;
@@ -65,9 +57,6 @@ body {
   overflow: hidden;
 }
 
-/* ════════════════════════════════════════════════════════════
-   SHELL
-════════════════════════════════════════════════════════════ */
 .room {
   display: flex;
   flex-direction: column;
@@ -95,7 +84,6 @@ body {
   }
 }
 
-/* ── Ambient background ────────────────────────────────────── */
 .room-bg {
   position: fixed;
   inset: 0;

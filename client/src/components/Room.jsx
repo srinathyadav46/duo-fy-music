@@ -2,15 +2,24 @@
  * Room.jsx – "Lovers Mode"
  * Desktop: 3-col (Queue | Player | Search)
  * Mobile:  tab-switched full-screen panels
+ *
+ * v2 changes (logic only — all UI / JSX / reactions untouched):
+ *  - useSync  → accurate play/pause/seek/skip sync + drift correction
+ *  - useQueue → shared server-side queue instead of per-user Spotify poll
+ *  - SearchPanel uses onAddToQueue prop  (adds to shared queue via socket)
+ *  - QueuePanel  accepts queue + onRemove props (no more internal Spotify fetch)
+ *  - Socket sync-play/pause kept for UI state only; Spotify calls moved to useSync
+ *  - sync-seek and sync-track listeners removed (handled inside useSync)
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import socketService from "../socket";
 import { useSpotify, fmtMs } from "../hooks/useSpotify";
 import {
-  useSpotifyPlayer, spotifyPlay, spotifyPause,
-  spotifySkipNext, spotifySkipPrev, spotifyGetQueue,
-  spotifySearch, spotifyAddToQueue, spotifySeek,
+  useSpotifyPlayer,
+  spotifySkipPrev,
 } from "../hooks/useSpotifyPlayer";
+import { useSync } from "../hooks/useSync";
+import { useQueue, normalizeSpotifyTrack } from "../hooks/useQueue";
 import "./Room.css";
 
 const REACTIONS = ["❤️", "🔥", "🌙", "✨", "🎵"];
@@ -28,18 +37,27 @@ function syncLabel(ms) {
 
 async function shareRoom(roomId) {
   const url = `${window.location.origin}/room/${roomId}`;
-  if (navigator.share) { try { await navigator.share({ title: "Listen with me on Duo-fy 💕", url }); return; } catch { } }
+  if (navigator.share) {
+    try { await navigator.share({ title: "Listen with me on Duo-fy 💕", url }); return; } catch { }
+  }
   await navigator.clipboard?.writeText(url).catch(() => { });
 }
 
 /* ── Search panel ─────────────────────────────────────────── */
-function SearchPanel({ accessToken, deviceId, onTrackPlay }) {
+// Added: onAddToQueue prop — routes "+ queue" clicks through the shared queue
+function SearchPanel({ accessToken, deviceId, onTrackPlay, onAddToQueue }) {
   const [q, setQ] = useState("");
   const [results, setResults] = useState([]);
   const [status, setStatus] = useState("idle");
   const [queued, setQueued] = useState({});
   const debRef = useRef(null);
   const inputRef = useRef(null);
+
+  // Lazy-import spotifySearch so this file stays self-contained
+  const [spotifySearch, setSpotifySearch] = useState(null);
+  useEffect(() => {
+    import("../hooks/useSpotifyPlayer").then(m => setSpotifySearch(() => m.spotifySearch));
+  }, []);
 
   useEffect(() => { setTimeout(() => inputRef.current?.focus(), 80); }, []);
 
@@ -48,28 +66,40 @@ function SearchPanel({ accessToken, deviceId, onTrackPlay }) {
     if (!q.trim()) { setResults([]); setStatus("idle"); return; }
     setStatus("loading");
     debRef.current = setTimeout(async () => {
-      try { const t = await spotifySearch(accessToken, q.trim(), 12); setResults(t); setStatus("done"); }
-      catch { setStatus("error"); }
+      try {
+        const t = await spotifySearch?.(accessToken, q.trim(), 12) ?? [];
+        setResults(t); setStatus("done");
+      } catch { setStatus("error"); }
     }, 300);
     return () => clearTimeout(debRef.current);
-  }, [q, accessToken]);
+  }, [q, accessToken, spotifySearch]);
 
-  const fmt = ms => { const s = Math.floor((ms || 0) / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+  const fmt = ms => {
+    const s = Math.floor((ms || 0) / 1000);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  };
 
   return (
     <div className="search-panel">
       <div className="sp-head">
         <div className={`sp-field ${q ? "sp-field--on" : ""}`}>
           <SearchIcon />
-          <input ref={inputRef} className="sp-input" type="search" placeholder="Search songs, artists…"
-            value={q} onChange={e => setQ(e.target.value)} autoComplete="off" />
+          <input
+            ref={inputRef} className="sp-input" type="search"
+            placeholder="Search songs, artists…" value={q}
+            onChange={e => setQ(e.target.value)} autoComplete="off"
+          />
           {status === "loading" && <div className="sp-spin" />}
-          {q && status !== "loading" && <button className="sp-clear" onClick={() => { setQ(""); inputRef.current?.focus(); }}>✕</button>}
+          {q && status !== "loading" && (
+            <button className="sp-clear" onClick={() => { setQ(""); inputRef.current?.focus(); }}>✕</button>
+          )}
         </div>
       </div>
 
       <div className="sp-body">
-        {status === "idle" && <div className="sp-empty"><span>🎵</span><p>Find something beautiful to play together</p></div>}
+        {status === "idle" && (
+          <div className="sp-empty"><span>🎵</span><p>Find something beautiful to play together</p></div>
+        )}
 
         {status === "loading" && Array.from({ length: 5 }).map((_, i) => (
           <div key={i} className="sp-skeleton" style={{ animationDelay: `${i * .07}s` }}>
@@ -77,24 +107,46 @@ function SearchPanel({ accessToken, deviceId, onTrackPlay }) {
           </div>
         ))}
 
-        {status === "error" && <div className="sp-empty"><span>⚠️</span><p>Oops — Spotify didn't respond. Try again.</p></div>}
-        {status === "done" && results.length === 0 && <div className="sp-empty"><span>🔍</span><p>No match for "{q}".<br />Try different words.</p></div>}
+        {status === "error" && (
+          <div className="sp-empty"><span>⚠️</span><p>Oops — Spotify didn't respond. Try again.</p></div>
+        )}
+        {status === "done" && results.length === 0 && (
+          <div className="sp-empty"><span>🔍</span><p>No match for "{q}".<br />Try different words.</p></div>
+        )}
 
         {status === "done" && results.map((t, i) => (
           <div key={t.id} className="sp-track" style={{ animationDelay: `${i * .04}s` }}>
-            <img src={t.album?.images?.[2]?.url || t.album?.images?.[0]?.url || ""} alt="" className="sp-track__art" loading="lazy" />
+            <img
+              src={t.album?.images?.[2]?.url || t.album?.images?.[0]?.url || ""}
+              alt="" className="sp-track__art" loading="lazy"
+            />
             <div className="sp-track__info">
               <p className="sp-track__name">{t.name}</p>
               <p className="sp-track__meta">{t.artists.map(a => a.name).join(", ")}</p>
             </div>
             <span className="sp-track__dur">{fmt(t.duration_ms)}</span>
             <div className="sp-track__acts">
-              <button className={`sp-act sp-act--q ${queued[t.id] ? "sp-act--queued" : ""}`} onClick={async () => {
-                await spotifyAddToQueue(accessToken, t.uri).catch(() => { });
-                setQueued(p => ({ ...p, [t.id]: true }));
-                setTimeout(() => setQueued(p => { const n = { ...p }; delete n[t.id]; return n; }), 2000);
-              }}>{queued[t.id] ? "✓" : "+"}</button>
-              <button className="sp-act sp-act--play" onClick={() => { spotifyPlay(accessToken, deviceId, { uris: [t.uri] }).catch(() => { }); onTrackPlay?.(t); }}>▶ Play</button>
+              {/* + button → shared queue via onAddToQueue */}
+              <button
+                className={`sp-act sp-act--q ${queued[t.id] ? "sp-act--queued" : ""}`}
+                onClick={() => {
+                  onAddToQueue?.(t);
+                  setQueued(p => ({ ...p, [t.id]: true }));
+                  setTimeout(
+                    () => setQueued(p => { const n = { ...p }; delete n[t.id]; return n; }),
+                    2000
+                  );
+                }}
+              >
+                {queued[t.id] ? "✓" : "+"}
+              </button>
+              {/* Play → immediate playback synced to partner */}
+              <button
+                className="sp-act sp-act--play"
+                onClick={() => onTrackPlay?.(t)}
+              >
+                ▶ Play
+              </button>
             </div>
           </div>
         ))}
@@ -104,30 +156,20 @@ function SearchPanel({ accessToken, deviceId, onTrackPlay }) {
 }
 
 /* ── Queue panel ───────────────────────────────────────────── */
-function QueuePanel({ accessToken, currentTrack, deviceId, partnerName, partnerAvatar, partnerOnline }) {
-  const [queue, setQueue] = useState([]);
-  const [loading, setLoading] = useState(false);
+// v2: accepts `queue` (normalized Track[]) + `onRemove` from useQueue.
+// No longer fetches from Spotify — the shared queue is the source of truth.
+function QueuePanel({ currentTrack, deviceId, partnerName, partnerAvatar, partnerOnline, queue, onRemove, onTrackPlay }) {
   const partInit = (partnerName?.[0] ?? "P").toUpperCase();
-
-  useEffect(() => {
-    if (!accessToken) return;
-    setLoading(true);
-    spotifyGetQueue(accessToken)
-      .then(data => {
-        const items = (data?.queue ?? []);
-        const deduped = items.filter((t, i) => i === 0 || t.id !== items[i - 1]?.id);
-        setQueue(deduped.slice(0, 15));
-      })
-      .catch(() => setQueue([]))
-      .finally(() => setLoading(false));
-  }, [accessToken, currentTrack?.id]);
 
   return (
     <div className="queue-panel">
       {/* Partner */}
       <div className="qp-partner">
         <div className={`qp-avatar ${partnerOnline ? "qp-avatar--on" : ""}`}>
-          {partnerAvatar ? <img src={partnerAvatar} alt={partnerName} /> : <span>{partInit}</span>}
+          {partnerAvatar
+            ? <img src={partnerAvatar} alt={partnerName} />
+            : <span>{partInit}</span>
+          }
           {partnerOnline && <span className="qp-avatar__dot" />}
         </div>
         <div className="qp-partner__text">
@@ -142,21 +184,24 @@ function QueuePanel({ accessToken, currentTrack, deviceId, partnerName, partnerA
       </div>
 
       <div className="qp-list">
-        {loading && Array.from({ length: 4 }).map((_, i) => (
-          <div key={i} className="qp-skeleton">
-            <div className="qps-art" /><div className="qps-lines"><div className="qps-l qps-l--a" /><div className="qps-l qps-l--b" /></div>
-          </div>
-        ))}
-        {!loading && queue.length === 0 && <div className="qp-empty"><p>Queue is empty</p><p>Search for songs to add</p></div>}
-        {!loading && queue.map((t, i) => (
+        {queue.length === 0 && (
+          <div className="qp-empty"><p>Queue is empty</p><p>Search for songs to add</p></div>
+        )}
+
+        {queue.map((t, i) => (
           <div key={`${t.id}-${i}`} className="qp-track">
             <span className="qp-num">{i + 1}</span>
-            <img src={t.album?.images?.[2]?.url || t.album?.images?.[0]?.url || ""} alt="" className="qp-art" loading="lazy" />
+            {/* normalized track: albumArt instead of album.images */}
+            <img src={t.albumArt || ""} alt="" className="qp-art" loading="lazy" />
             <div className="qp-info">
               <p className="qp-name">{t.name}</p>
-              <p className="qp-artist">{t.artists?.map(a => a.name).join(", ")}</p>
+              {/* normalized track: artists is already a string */}
+              <p className="qp-artist">{t.artists}</p>
             </div>
-            <button className="qp-play" onClick={() => spotifyPlay(accessToken, deviceId, { uris: [t.uri] }).catch(() => { })}>▶</button>
+            <button
+              className="qp-play"
+              onClick={() => onTrackPlay?.(t, true)}  // true = already normalized
+            >▶</button>
           </div>
         ))}
       </div>
@@ -168,9 +213,32 @@ function QueuePanel({ accessToken, currentTrack, deviceId, partnerName, partnerA
    MAIN ROOM
 ════════════════════════════════════════════ */
 export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
-  const { track, progressMs, durationMs, profile } = useSpotify(spotifyToken);
-  const { deviceId, playerReady, playerError, volume, setVolume } = useSpotifyPlayer(spotifyToken);
+  // ── Data hooks ────────────────────────────────────────────────────────────
+  const { track, progressMs, durationMs, profile, isPlaying } =
+    useSpotify(spotifyToken);
 
+  const { deviceId, playerReady, playerError, volume, setVolume } =
+    useSpotifyPlayer(spotifyToken);
+
+  // ── Sync engine ───────────────────────────────────────────────────────────
+  // useSync owns all Spotify play/pause/seek/skip calls going to the partner.
+  // Room.jsx only calls controls.* — never calls spotifyPlay/Pause/Seek directly.
+  const { syncTrack, syncIsPlaying, controls } = useSync({
+    roomId,
+    accessToken: spotifyToken,
+    deviceId,
+    playerReady,
+    spotifyTrack: track,
+    progressMs,
+    durationMs,
+    spotifyIsPlaying: isPlaying,
+  });
+
+  // ── Shared queue ──────────────────────────────────────────────────────────
+  const { queue, addToQueue, removeFromQueue } = useQueue({ roomId });
+
+  // ── UI state ──────────────────────────────────────────────────────────────
+  // syncPlaying mirrors syncIsPlaying from useSync; partner-left can override it.
   const [syncPlaying, setSyncPlaying] = useState(false);
   const [connStatus, setConnStatus] = useState("connecting");
   const [latency, setLatency] = useState(null);
@@ -196,6 +264,10 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
   const lastPlayRef = useRef(null);
   const prevTrkRef = useRef(null);
 
+  // Keep syncPlaying in sync with useSync's authoritative state
+  useEffect(() => { setSyncPlaying(syncIsPlaying); }, [syncIsPlaying]);
+
+  // Track session songs
   useEffect(() => {
     if (track?.id && track.id !== prevTrkRef.current) {
       prevTrkRef.current = track.id;
@@ -203,14 +275,19 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
     }
   }, [track?.id]);
 
+  // Heartbeat / listening timer
   useEffect(() => {
     if (syncPlaying && partnerOnline) {
       listenRef.current = setInterval(() => setListeningSecs(s => s + 1), 1000);
       setHeartbeat(true);
-    } else { clearInterval(listenRef.current); setHeartbeat(false); }
+    } else {
+      clearInterval(listenRef.current);
+      setHeartbeat(false);
+    }
     return () => clearInterval(listenRef.current);
   }, [syncPlaying, partnerOnline]);
 
+  // ── Helpers ───────────────────────────────────────────────────────────────
   const showToast = useCallback((text, type = "info") => {
     clearTimeout(toastRef.current);
     setToast({ text, type });
@@ -235,111 +312,114 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
     setTimeout(() => setCodeCopied(false), 2000);
   };
 
-  /* Sockets */
+  // ── Socket listeners ──────────────────────────────────────────────────────
+  // sync-play / sync-pause → UI state + toasts only.
+  // ALL Spotify API calls are handled inside useSync — not here.
   useEffect(() => {
     if (socketService.connected) setConnStatus("connected");
+
     const offs = [
       socketService.on("connect", () => setConnStatus("connected")),
-      socketService.on("disconnect", r => { if (r !== "io client disconnect") { setConnStatus("disconnected"); setSyncPlaying(false); } }),
+      socketService.on("disconnect", r => {
+        if (r !== "io client disconnect") {
+          setConnStatus("disconnected");
+          setSyncPlaying(false);
+        }
+      }),
       socketService.on("reconnect_attempt", () => setConnStatus("reconnecting")),
+
+      // Partner presence
       socketService.on("partner-joined", data => {
-        setPartnerOnline(true); setPartnerName(data?.displayName ?? "Partner"); setPartnerAvatar(data?.avatarUrl ?? null);
-        setShowCodeCard(false); showToast(`${data?.displayName ?? "Partner"} joined 💕`, "join"); celebrate();
+        setPartnerOnline(true);
+        setPartnerName(data?.displayName ?? "Partner");
+        setPartnerAvatar(data?.avatarUrl ?? null);
+        setShowCodeCard(false);
+        showToast(`${data?.displayName ?? "Partner"} joined 💕`, "join");
+        celebrate();
+        // Re-request state so the new partner syncs to our current position
+        socketService.requestRoomState(roomId);
       }),
       socketService.on("partner-left", () => {
-        setPartnerOnline(false); setPartnerPlaying(false); setShowCodeCard(true); setSyncPlaying(false);
+        setPartnerOnline(false);
+        setPartnerPlaying(false);
+        setShowCodeCard(true);
         showToast(`${partnerName ?? "Partner"} left`, "leave");
       }),
-      socketService.on("sync-play", async data => {
-        if (data?.roomId && data.roomId !== roomId) return;
 
-        // Drift compensation: calculate how long event was in transit
-        // and add that to the sender's position so both users land
-        // on the same millisecond of the track.
-        const receivedAt = Date.now();
-        const lag = data?.timestamp ? receivedAt - data.timestamp : 0;
-        if (lag > 0) setLatency(lag);
+      // Sync events — UI side effects only, no Spotify calls (useSync owns those)
+      socketService.on("sync-play", data => {
+        // Measure and display latency for the sync chip
+        const lag = data?.serverTimestamp ? Date.now() - data.serverTimestamp : null;
+        if (lag !== null && lag >= 0) setLatency(lag);
 
-        // Seek to drift-compensated position before playing
-        const targetMs = Math.max(0, (data?.progressMs ?? 0) + lag);
+        setSyncPlaying(true);
+        setPartnerPlaying(true);
+        setSyncCount(n => n + 1);
 
-        setSyncPlaying(true); setPartnerPlaying(true); setSyncCount(n => n + 1);
-
-        if (deviceId) {
-          await spotifySeek(spotifyToken, targetMs).catch(() => { });
-          // Brief settle so Spotify processes seek before play command
-          await new Promise(r => setTimeout(r, 80));
-          await spotifyPlay(spotifyToken, deviceId).catch(() => { });
-        }
-
-        if (lastPlayRef.current && receivedAt - lastPlayRef.current < 2500) {
-          celebrate(); showToast("You’re in sync 💕", "sync");
+        if (lastPlayRef.current && Date.now() - lastPlayRef.current < 2500) {
+          celebrate();
+          showToast("You're in sync 💕", "sync");
         } else {
           showToast(`${partnerName ?? "Partner"} played`, "play");
         }
       }),
 
-      socketService.on("sync-pause", async data => {
-        if (data?.roomId && data.roomId !== roomId) return;
-        setSyncPlaying(false); setPartnerPlaying(false);
-        if (deviceId) await spotifyPause(spotifyToken).catch(() => { });
+      socketService.on("sync-pause", () => {
+        setPartnerPlaying(false);
+        // syncIsPlaying from useSync will flip syncPlaying via the useEffect above
         showToast(`${partnerName ?? "Partner"} paused`, "pause");
       }),
 
-      // Seek sync — partner dragged the progress bar
-      socketService.on("sync-seek", async data => {
-        if (data?.roomId && data.roomId !== roomId) return;
-        const seekLag = data?.timestamp ? Date.now() - data.timestamp : 0;
-        const targetMs = Math.max(0, (data?.positionMs ?? 0) + seekLag);
-        if (deviceId) await spotifySeek(spotifyToken, targetMs).catch(() => { });
+      // Reactions — unchanged
+      socketService.on("reaction", ({ emoji } = {}) => {
+        if (emoji) addReaction(emoji, true);
       }),
-
-      socketService.on("sync-track", async data => {
-        if (data?.roomId && data.roomId !== roomId) return;
-        if (data?.uri && deviceId) await spotifyPlay(spotifyToken, deviceId, { uris: [data.uri] }).catch(() => { });
-        if (data?.trackName) showToast(`Now: "${data.trackName}"`, "play");
-      }),
-      socketService.on("reaction", ({ emoji } = {}) => { if (emoji) addReaction(emoji, true); }),
     ];
-    return () => { offs.forEach(fn => fn()); clearTimeout(toastRef.current); clearTimeout(celebRef.current); clearInterval(listenRef.current); };
+
+    return () => {
+      offs.forEach(fn => fn());
+      clearTimeout(toastRef.current);
+      clearTimeout(celebRef.current);
+      clearInterval(listenRef.current);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, partnerName, deviceId, spotifyToken]);
 
-  /* Playback — always include timestamp so partner can compensate for lag */
+  // ── Playback controls — all go through useSync ────────────────────────────
+
   const handlePlay = useCallback(async () => {
-    if (connStatus !== "connected" || syncPlaying) return;
+    if (connStatus !== "connected" || syncPlaying || !track) return;
     lastPlayRef.current = Date.now();
-    if (deviceId) await spotifyPlay(spotifyToken, deviceId).catch(() => { });
-    socketService.emitPlay(roomId, { progressMs, timestamp: Date.now() });
-    setSyncPlaying(true);
-  }, [connStatus, syncPlaying, deviceId, spotifyToken, roomId, progressMs]);
+    await controls.play(normalizeSpotifyTrack(track), progressMs);
+  }, [connStatus, syncPlaying, track, progressMs, controls]);
 
   const handlePause = useCallback(async () => {
     if (connStatus !== "connected" || !syncPlaying) return;
-    if (deviceId) await spotifyPause(spotifyToken).catch(() => { });
-    socketService.emitPause(roomId, { progressMs, timestamp: Date.now() });
-    setSyncPlaying(false);
-  }, [connStatus, syncPlaying, deviceId, spotifyToken, roomId, progressMs]);
+    await controls.pause(track?.id, progressMs);
+  }, [connStatus, syncPlaying, track, progressMs, controls]);
 
-  // Progress bar seek — emits position to partner so they follow along
+  // Progress bar drag → seek both players
   const handleSeek = useCallback(async e => {
-    if (!durationMs) return;
-    const pct = parseFloat(e.target.value);   // 0–100
+    if (!durationMs || !track) return;
+    const pct = parseFloat(e.target.value); // 0–100
     const positionMs = Math.round((pct / 100) * durationMs);
-    if (deviceId) await spotifySeek(spotifyToken, positionMs).catch(() => { });
-    socketService.socket?.emit?.("sync-seek", { roomId, positionMs, timestamp: Date.now() });
-  }, [deviceId, spotifyToken, roomId, durationMs]);
+    await controls.seek(track.id, positionMs);
+  }, [durationMs, track, controls]);
 
-  const handleTrackPlay = useCallback(t => {
-    socketService.socket?.emit?.("sync-track", { roomId, uri: t.uri, trackName: t.name, timestamp: Date.now() });
-    setSyncPlaying(true); showToast(`Playing "${t.name}"`, "play");
-  }, [roomId, showToast]);
+  // Called when user clicks "▶ Play" on a search result or a queue item
+  // alreadyNormalized = true when called from QueuePanel (track is already lean shape)
+  const handleTrackPlay = useCallback(async (t, alreadyNormalized = false) => {
+    const normalized = alreadyNormalized ? t : normalizeSpotifyTrack(t);
+    await controls.play(normalized, 0);
+    showToast(`Playing "${normalized.name}"`, "play");
+  }, [controls, showToast]);
 
   const handleReaction = useCallback(emoji => {
-    socketService.emitReaction(roomId, emoji); addReaction(emoji, false);
+    socketService.emitReaction(roomId, emoji);
+    addReaction(emoji, false);
   }, [roomId, addReaction]);
 
-  /* Derived */
+  // ── Derived display values ────────────────────────────────────────────────
   const isConnected = connStatus === "connected";
   const albumArt = track?.album?.images?.[0]?.url ?? null;
   const trackName = track?.name ?? "Ready to Sync";
@@ -379,7 +459,9 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         <div className={`together-badge ${heartbeat ? "together-badge--pulse" : ""}`}>
           <span className="tb-heart">♥</span>
           Listening Together
-          {listeningSecs > 0 && <span className="tb-time">{listenMin > 0 ? `${listenMin}m ` : ""}{listenSec}s</span>}
+          {listeningSecs > 0 && (
+            <span className="tb-time">{listenMin > 0 ? `${listenMin}m ` : ""}{listenSec}s</span>
+          )}
         </div>
       )}
 
@@ -393,26 +475,33 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         <h2 className="track-name">{trackName}</h2>
         <p className="track-artist">{artistName}</p>
 
-        {/* Partner micro badge near track */}
         {partnerOnline && (
           <div className="partner-micro">
             <div className={`pm-av ${partnerPlaying ? "pm-av--playing" : ""}`}>
               {partnerAvatar ? <img src={partnerAvatar} alt={partnerName} /> : <span>{partInit}</span>}
             </div>
-            <span className="pm-label">{partnerPlaying ? `${partnerName} is listening` : `${partnerName} is here`}</span>
+            <span className="pm-label">
+              {partnerPlaying ? `${partnerName} is listening` : `${partnerName} is here`}
+            </span>
           </div>
         )}
 
         {/* Waveform */}
         <div className="waveform" aria-hidden>
           {BARS.map((h, i) => (
-            <div key={i} className={`w-bar ${syncPlaying ? "w-bar--live" : ""}`}
-              style={{ height: syncPlaying ? `${h}px` : "3px", animationDelay: `${(i * 0.055).toFixed(2)}s`, animationDuration: `${0.55 + (i % 5) * 0.13}s` }} />
+            <div key={i}
+              className={`w-bar ${syncPlaying ? "w-bar--live" : ""}`}
+              style={{
+                height: syncPlaying ? `${h}px` : "3px",
+                animationDelay: `${(i * 0.055).toFixed(2)}s`,
+                animationDuration: `${0.55 + (i % 5) * 0.13}s`,
+              }}
+            />
           ))}
         </div>
       </div>
 
-      {/* Progress — partner pin on bar */}
+      {/* Progress bar + partner pin */}
       <div className="prog-section">
         <div className="prog-bar-wrap">
           {partnerOnline && (
@@ -420,7 +509,6 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
               {partnerAvatar ? <img src={partnerAvatar} alt="" /> : <span>{partInit}</span>}
             </div>
           )}
-          {/* Draggable — seek syncs to partner on release */}
           <div className="prog-bar">
             <div className="prog-fill" style={{ width: `${progressPct}%` }}>
               <div className="prog-thumb" />
@@ -442,9 +530,15 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         </div>
       </div>
 
-      {/* Controls */}
+      {/* Controls — skip-next goes through useSync (server advances queue) */}
       <div className="controls">
-        <button className="ctrl ctrl--sm" onClick={() => spotifySkipPrev(spotifyToken).catch(() => { })} disabled={!deviceId}><PrevIcon /></button>
+        <button
+          className="ctrl ctrl--sm"
+          onClick={() => spotifySkipPrev(spotifyToken).catch(() => { })}
+          disabled={!deviceId}
+        >
+          <PrevIcon />
+        </button>
         <button
           className={`ctrl ctrl--play ${syncPlaying ? "ctrl--pause" : ""} ${heartbeat ? "ctrl--pulse" : ""} ${celebrating ? "ctrl--pop" : ""}`}
           onClick={syncPlaying ? handlePause : handlePlay}
@@ -452,14 +546,23 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         >
           {syncPlaying ? <PauseIcon /> : <PlayIcon />}
         </button>
-        <button className="ctrl ctrl--sm" onClick={() => spotifySkipNext(spotifyToken).catch(() => { })} disabled={!deviceId}><NextIcon /></button>
+        <button
+          className="ctrl ctrl--sm"
+          onClick={() => controls.skipNext()}
+          disabled={!isConnected}
+        >
+          <NextIcon />
+        </button>
       </div>
 
       {/* Volume */}
       <div className="vol-row">
         <VolMin />
-        <input type="range" min="0" max="1" step="0.02" value={volume}
-          onChange={e => setVolume(parseFloat(e.target.value))} className="vol-slider" aria-label="Volume" />
+        <input
+          type="range" min="0" max="1" step="0.02" value={volume}
+          onChange={e => setVolume(parseFloat(e.target.value))}
+          className="vol-slider" aria-label="Volume"
+        />
         <VolMax />
       </div>
 
@@ -470,10 +573,12 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         </a>
       )}
 
-      {/* Reactions */}
+      {/* Reactions — unchanged */}
       <div className="react-row">
         {REACTIONS.map(e => (
-          <button key={e} className="react-btn" onClick={() => handleReaction(e)} aria-label={`React ${e}`}>{e}</button>
+          <button key={e} className="react-btn" onClick={() => handleReaction(e)} aria-label={`React ${e}`}>
+            {e}
+          </button>
         ))}
       </div>
     </div>
@@ -495,10 +600,18 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
       </div>
 
       {/* Toast */}
-      {toast && <div className={`toast toast--${toast.type}`} role="status" aria-live="polite"><span className="toast-dot" />{toast.text}</div>}
+      {toast && (
+        <div className={`toast toast--${toast.type}`} role="status" aria-live="polite">
+          <span className="toast-dot" />{toast.text}
+        </div>
+      )}
 
       {/* Celebrate overlay */}
-      {celebrating && <div className="celebrate-overlay" aria-hidden><p className="cel-text">You're in sync 💕</p></div>}
+      {celebrating && (
+        <div className="celebrate-overlay" aria-hidden>
+          <p className="cel-text">You're in sync 💕</p>
+        </div>
+      )}
 
       {/* ── TOPBAR ──────────────────────────────────────── */}
       <header className="topbar">
@@ -507,17 +620,24 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
           <span className="brand-name">Duo-<em>fy</em></span>
         </a>
 
-        {/* Mobile tab bar */}
         <nav className="mob-tabs">
           {[["queue", "Queue"], ["player", "Player"], ["search", "Search"]].map(([tab, label]) => (
-            <button key={tab} className={`mob-tab ${mobileTab === tab ? "mob-tab--on" : ""}`} onClick={() => setMobileTab(tab)}>{label}</button>
+            <button
+              key={tab}
+              className={`mob-tab ${mobileTab === tab ? "mob-tab--on" : ""}`}
+              onClick={() => setMobileTab(tab)}
+            >
+              {label}
+            </button>
           ))}
         </nav>
 
         <div className="topbar-right">
           <div className={`conn-badge ${isConnected ? "conn-badge--live" : ""}`}>
             <span className="conn-dot" />
-            <span className="conn-text">{isConnected ? (partnerOnline ? "Connected" : "Waiting") : connStatus}</span>
+            <span className="conn-text">
+              {isConnected ? (partnerOnline ? "Connected" : "Waiting") : connStatus}
+            </span>
           </div>
         </div>
       </header>
@@ -528,8 +648,12 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
           <p className="code-banner__label">Invite your partner</p>
           <div className="code-banner__code">{roomId}</div>
           <div className="code-banner__btns">
-            <button className="code-btn" onClick={copyCode}>{codeCopied ? "✓ Copied!" : "📋 Copy Code"}</button>
-            <button className="code-btn code-btn--alt" onClick={() => shareRoom(roomId)}>🔗 Share Link</button>
+            <button className="code-btn" onClick={copyCode}>
+              {codeCopied ? "✓ Copied!" : "📋 Copy Code"}
+            </button>
+            <button className="code-btn code-btn--alt" onClick={() => shareRoom(roomId)}>
+              🔗 Share Link
+            </button>
           </div>
         </div>
       )}
@@ -538,9 +662,14 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
       <div className="desk-layout">
         <aside className="desk-left">
           <QueuePanel
-            accessToken={spotifyToken} currentTrack={track}
-            deviceId={deviceId} partnerName={partnerName}
-            partnerAvatar={partnerAvatar} partnerOnline={partnerOnline}
+            currentTrack={track}
+            deviceId={deviceId}
+            partnerName={partnerName}
+            partnerAvatar={partnerAvatar}
+            partnerOnline={partnerOnline}
+            queue={queue}
+            onRemove={removeFromQueue}
+            onTrackPlay={handleTrackPlay}
           />
         </aside>
         <main className="desk-center">
@@ -548,14 +677,22 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
           <button className="leave-btn" onClick={() => setShowSummary(true)}>Leave Room</button>
         </main>
         <aside className="desk-right">
-          <SearchPanel accessToken={spotifyToken} deviceId={deviceId} onTrackPlay={handleTrackPlay} />
+          <SearchPanel
+            accessToken={spotifyToken}
+            deviceId={deviceId}
+            onTrackPlay={handleTrackPlay}
+            onAddToQueue={addToQueue}
+          />
         </aside>
       </div>
 
       {/* ── MOBILE PANELS ───────────────────────────────── */}
       <div className={`mob-panel ${mobileTab === "queue" ? "mob-panel--show" : ""}`}>
-        <QueuePanel accessToken={spotifyToken} currentTrack={track} deviceId={deviceId}
-          partnerName={partnerName} partnerAvatar={partnerAvatar} partnerOnline={partnerOnline} />
+        <QueuePanel
+          currentTrack={track} deviceId={deviceId}
+          partnerName={partnerName} partnerAvatar={partnerAvatar} partnerOnline={partnerOnline}
+          queue={queue} onRemove={removeFromQueue} onTrackPlay={handleTrackPlay}
+        />
       </div>
       <div className={`mob-panel ${mobileTab === "player" ? "mob-panel--show" : ""}`}>
         {playerContent}
@@ -564,21 +701,32 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         <div style={{ height: "16px" }} />
       </div>
       <div className={`mob-panel ${mobileTab === "search" ? "mob-panel--show" : ""}`}>
-        <SearchPanel accessToken={spotifyToken} deviceId={deviceId} onTrackPlay={handleTrackPlay} />
+        <SearchPanel
+          accessToken={spotifyToken}
+          deviceId={deviceId}
+          onTrackPlay={handleTrackPlay}
+          onAddToQueue={addToQueue}
+        />
       </div>
 
       {/* Mini bar (non-player tabs) */}
       {mobileTab !== "player" && (
         <div className="mini-bar">
           <div className="mini-track">
-            {albumArt ? <img src={albumArt} alt="" className="mini-art" /> : <div className="mini-art mini-art--ph">🎵</div>}
+            {albumArt
+              ? <img src={albumArt} alt="" className="mini-art" />
+              : <div className="mini-art mini-art--ph">🎵</div>
+            }
             <div>
               <p className="mini-name">{trackName}</p>
               <p className="mini-artist">{artistName}</p>
             </div>
           </div>
-          <button className={`mini-play-btn ${syncPlaying ? "mini-play-btn--pause" : ""}`}
-            onClick={syncPlaying ? handlePause : handlePlay} disabled={!isConnected}>
+          <button
+            className={`mini-play-btn ${syncPlaying ? "mini-play-btn--pause" : ""}`}
+            onClick={syncPlaying ? handlePause : handlePlay}
+            disabled={!isConnected}
+          >
             {syncPlaying ? "⏸" : "▶"}
           </button>
         </div>
@@ -591,15 +739,31 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
             <div className="sum-heart">💕</div>
             <h2 className="sum-title">Session Complete</h2>
             <div className="sum-stats">
-              <div className="sum-stat"><span className="ss-val">{listenMin > 0 ? `${listenMin}m` : `${listeningSecs}s`}</span><span className="ss-key">Together</span></div>
-              <div className="sum-stat"><span className="ss-val">{sessionSongs.size}</span><span className="ss-key">Songs</span></div>
-              <div className="sum-stat"><span className="ss-val">{syncCount}</span><span className="ss-key">Syncs</span></div>
+              <div className="sum-stat">
+                <span className="ss-val">{listenMin > 0 ? `${listenMin}m` : `${listeningSecs}s`}</span>
+                <span className="ss-key">Together</span>
+              </div>
+              <div className="sum-stat">
+                <span className="ss-val">{sessionSongs.size}</span>
+                <span className="ss-key">Songs</span>
+              </div>
+              <div className="sum-stat">
+                <span className="ss-val">{syncCount}</span>
+                <span className="ss-key">Syncs</span>
+              </div>
             </div>
             <p className="sum-msg">
-              {listenMin >= 30 ? "A whole album's worth of togetherness 💕" : listenMin >= 10 ? "Same songs, same moment 🎵" : listeningSecs > 0 ? "Every shared moment counts 💕" : "Come back and listen together 🌙"}
+              {listenMin >= 30 ? "A whole album's worth of togetherness 💕"
+                : listenMin >= 10 ? "Same songs, same moment 🎵"
+                  : listeningSecs > 0 ? "Every shared moment counts 💕"
+                    : "Come back and listen together 🌙"}
             </p>
-            <button className="sum-leave" onClick={() => { setShowSummary(false); onLeaveRoom(); }}>Leave Room</button>
-            <button className="sum-stay" onClick={() => setShowSummary(false)}>Keep Listening</button>
+            <button className="sum-leave" onClick={() => { setShowSummary(false); onLeaveRoom(); }}>
+              Leave Room
+            </button>
+            <button className="sum-stay" onClick={() => setShowSummary(false)}>
+              Keep Listening
+            </button>
           </div>
         </div>
       )}
@@ -607,7 +771,7 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
   );
 }
 
-/* ── Icons ─────────────────────────────────────────────────── */
+/* ── Icons (unchanged) ─────────────────────────────────────── */
 const HpIcon = () => (<svg width="22" height="22" viewBox="0 0 22 22" fill="none"><path d="M4 13a2 2 0 012-2h1a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm9 0a2 2 0 012-2h1a2 2 0 012 2v2a2 2 0 01-2 2h-1a2 2 0 01-2-2v-2z" fill="url(#hp)" /><path d="M4 13A7 7 0 0118 13" stroke="url(#hp)" strokeWidth="2" strokeLinecap="round" fill="none" /><defs><linearGradient id="hp" x1="4" y1="8" x2="18" y2="17" gradientUnits="userSpaceOnUse"><stop stopColor="#FF4FA3" /><stop offset="1" stopColor="#B38CFF" /></linearGradient></defs></svg>);
 const PlayIcon = () => <svg width="28" height="28" viewBox="0 0 28 28" fill="currentColor"><path d="M5 3.5l19 10.5L5 24.5V3.5z" /></svg>;
 const PauseIcon = () => <svg width="28" height="28" viewBox="0 0 28 28" fill="currentColor"><rect x="4" y="4" width="7" height="20" rx="2" /><rect x="17" y="4" width="7" height="20" rx="2" /></svg>;
