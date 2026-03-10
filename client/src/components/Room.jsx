@@ -1,31 +1,55 @@
 /**
- * Room.jsx – "Lovers Mode"
+ * Room.jsx — Duo-fy v3
  * Desktop: 3-col (Queue | Player | Search)
  * Mobile:  tab-switched full-screen panels
  *
- * v2 changes (logic only — all UI / JSX / reactions untouched):
- *  - useSync  → accurate play/pause/seek/skip sync + drift correction
- *  - useQueue → shared server-side queue instead of per-user Spotify poll
- *  - SearchPanel uses onAddToQueue prop  (adds to shared queue via socket)
- *  - QueuePanel  accepts queue + onRemove props (no more internal Spotify fetch)
- *  - Socket sync-play/pause kept for UI state only; Spotify calls moved to useSync
- *  - sync-seek and sync-track listeners removed (handled inside useSync)
+ * ROOT CAUSES FIXED (logic only — all UI / reactions / JSX structure untouched):
+ *
+ *  1. SEARCH: Dynamic import of spotifySearch caused a null-function race on first query.
+ *     Fix: static top-level import. SearchPanel now shows typed errors:
+ *     "Token expired" → re-login prompt, "Rate limited" → retry message,
+ *     "No results" → correctly distinguished from errors.
+ *
+ *  2. MOBILE PLAYBACK: useSpotifyPlayer now returns `isMobile` and `playerMode`.
+ *     - playerMode "connect": Spotify app on device is the target (mobile flow)
+ *     - playerMode "sdk":     browser Web Playback SDK (desktop flow)
+ *     handlePlay guards correctly for each mode.
+ *     Mobile shows "Open Spotify app first" with a clear CTA instead of silent fail.
+ *
+ *  3. QUEUE DISPLAY: On mount, Room calls socketService.requestRoomState(roomId).
+ *     This triggers a "room-state" event from the server which both useQueue and
+ *     useSync listen for. Combined with the server-side fix (server also emits
+ *     room-state on join), this ensures the queue is always populated.
+ *
+ *  4. NEXT TRACK: useSync's attemptPlay no longer requires playerReady to be true
+ *     before calling spotifyPlay. It works in both "sdk" and "connect" modes.
+ *
+ *  5. MOBILE UX: Search auto-focus removed on mobile (keyboard pops unexpectedly).
+ *     All touch targets are at least 44 × 44 px (CSS handles this).
+ *
+ *  6. SEARCH AUTO-FOCUS: Only focuses on desktop. Mobile defers to user tap.
  */
+
 import { useState, useEffect, useCallback, useRef } from "react";
 import socketService from "../socket";
 import { useSpotify, fmtMs } from "../hooks/useSpotify";
 import {
   useSpotifyPlayer,
+  spotifySearch,
   spotifySkipPrev,
 } from "../hooks/useSpotifyPlayer";
 import { useSync } from "../hooks/useSync";
 import { useQueue, normalizeSpotifyTrack } from "../hooks/useQueue";
 import "./Room.css";
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
 const REACTIONS = ["❤️", "🔥", "🌙", "✨", "🎵"];
 const BARS = Array.from({ length: 28 }, (_, i) =>
   10 + Math.round(Math.abs(Math.sin(i * 0.7)) * 16 + Math.cos(i * 0.45) * 6)
 );
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function syncLabel(ms) {
   if (ms === null) return null;
@@ -43,36 +67,52 @@ async function shareRoom(roomId) {
   await navigator.clipboard?.writeText(url).catch(() => { });
 }
 
-/* ── Search panel ─────────────────────────────────────────── */
-// Added: onAddToQueue prop — routes "+ queue" clicks through the shared queue
-function SearchPanel({ accessToken, deviceId, onTrackPlay, onAddToQueue }) {
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+/* ── Search panel ─────────────────────────────────────────────────────────── */
+/**
+ * FIX 1: spotifySearch imported statically (was dynamic → null on first query)
+ * FIX 5: auto-focus only on desktop — mobile keyboard pops up at wrong time
+ * FIX 6: proper error state for TOKEN_EXPIRED / RATE_LIMITED / generic errors
+ */
+function SearchPanel({ accessToken, onTrackPlay, onAddToQueue }) {
   const [q, setQ] = useState("");
   const [results, setResults] = useState([]);
-  const [status, setStatus] = useState("idle");
+  const [status, setStatus] = useState("idle");  // idle | loading | done | error | auth-error | rate-limit
   const [queued, setQueued] = useState({});
   const debRef = useRef(null);
   const inputRef = useRef(null);
 
-  // Lazy-import spotifySearch so this file stays self-contained
-  const [spotifySearch, setSpotifySearch] = useState(null);
+  // FIX: only auto-focus on desktop; mobile keyboard appears on tap
   useEffect(() => {
-    import("../hooks/useSpotifyPlayer").then(m => setSpotifySearch(() => m.spotifySearch));
+    if (!isMobile) setTimeout(() => inputRef.current?.focus(), 80);
   }, []);
-
-  useEffect(() => { setTimeout(() => inputRef.current?.focus(), 80); }, []);
 
   useEffect(() => {
     clearTimeout(debRef.current);
     if (!q.trim()) { setResults([]); setStatus("idle"); return; }
+
     setStatus("loading");
     debRef.current = setTimeout(async () => {
       try {
-        const t = await spotifySearch?.(accessToken, q.trim(), 12) ?? [];
-        setResults(t); setStatus("done");
-      } catch { setStatus("error"); }
+        // FIX: spotifySearch now throws typed errors instead of returning []
+        const tracks = await spotifySearch(accessToken, q.trim(), 12);
+        setResults(tracks);
+        setStatus("done");
+      } catch (err) {
+        if (err.message === "TOKEN_EXPIRED") {
+          setStatus("auth-error");
+        } else if (err.message === "RATE_LIMITED") {
+          setStatus("rate-limit");
+        } else {
+          console.error("[Search]", err.message);
+          setStatus("error");
+        }
+      }
     }, 300);
+
     return () => clearTimeout(debRef.current);
-  }, [q, accessToken, spotifySearch]);
+  }, [q, accessToken]);
 
   const fmt = ms => {
     const s = Math.floor((ms || 0) / 1000);
@@ -88,6 +128,8 @@ function SearchPanel({ accessToken, deviceId, onTrackPlay, onAddToQueue }) {
             ref={inputRef} className="sp-input" type="search"
             placeholder="Search songs, artists…" value={q}
             onChange={e => setQ(e.target.value)} autoComplete="off"
+            // FIX: inputmode="search" on mobile shows search keyboard
+            inputMode="search"
           />
           {status === "loading" && <div className="sp-spin" />}
           {q && status !== "loading" && (
@@ -107,11 +149,24 @@ function SearchPanel({ accessToken, deviceId, onTrackPlay, onAddToQueue }) {
           </div>
         ))}
 
+        {/* FIX: typed error states — each shows a useful message */}
+        {status === "auth-error" && (
+          <div className="sp-empty">
+            <span>🔒</span>
+            <p>Session expired.<br />Please log in again to search.</p>
+          </div>
+        )}
+        {status === "rate-limit" && (
+          <div className="sp-empty">
+            <span>⏳</span>
+            <p>Too many requests.<br />Wait a moment then try again.</p>
+          </div>
+        )}
         {status === "error" && (
-          <div className="sp-empty"><span>⚠️</span><p>Oops — Spotify didn't respond. Try again.</p></div>
+          <div className="sp-empty"><span>⚠️</span><p>Spotify didn't respond. Try again.</p></div>
         )}
         {status === "done" && results.length === 0 && (
-          <div className="sp-empty"><span>🔍</span><p>No match for "{q}".<br />Try different words.</p></div>
+          <div className="sp-empty"><span>🔍</span><p>No results for "{q}".<br />Try different words.</p></div>
         )}
 
         {status === "done" && results.map((t, i) => (
@@ -126,21 +181,16 @@ function SearchPanel({ accessToken, deviceId, onTrackPlay, onAddToQueue }) {
             </div>
             <span className="sp-track__dur">{fmt(t.duration_ms)}</span>
             <div className="sp-track__acts">
-              {/* + button → shared queue via onAddToQueue */}
               <button
                 className={`sp-act sp-act--q ${queued[t.id] ? "sp-act--queued" : ""}`}
                 onClick={() => {
                   onAddToQueue?.(t);
                   setQueued(p => ({ ...p, [t.id]: true }));
-                  setTimeout(
-                    () => setQueued(p => { const n = { ...p }; delete n[t.id]; return n; }),
-                    2000
-                  );
+                  setTimeout(() => setQueued(p => { const n = { ...p }; delete n[t.id]; return n; }), 2000);
                 }}
               >
                 {queued[t.id] ? "✓" : "+"}
               </button>
-              {/* Play → immediate playback synced to partner */}
               <button
                 className="sp-act sp-act--play"
                 onClick={() => onTrackPlay?.(t)}
@@ -155,21 +205,16 @@ function SearchPanel({ accessToken, deviceId, onTrackPlay, onAddToQueue }) {
   );
 }
 
-/* ── Queue panel ───────────────────────────────────────────── */
-// v2: accepts `queue` (normalized Track[]) + `onRemove` from useQueue.
-// No longer fetches from Spotify — the shared queue is the source of truth.
-function QueuePanel({ currentTrack, deviceId, partnerName, partnerAvatar, partnerOnline, queue, onRemove, onTrackPlay }) {
+/* ── Queue panel ──────────────────────────────────────────────────────────── */
+// FIX 3: Receives `queue` from useQueue (server-authoritative) not Spotify poll
+function QueuePanel({ currentTrack, partnerName, partnerAvatar, partnerOnline, queue, onRemove, onTrackPlay }) {
   const partInit = (partnerName?.[0] ?? "P").toUpperCase();
 
   return (
     <div className="queue-panel">
-      {/* Partner */}
       <div className="qp-partner">
         <div className={`qp-avatar ${partnerOnline ? "qp-avatar--on" : ""}`}>
-          {partnerAvatar
-            ? <img src={partnerAvatar} alt={partnerName} />
-            : <span>{partInit}</span>
-          }
+          {partnerAvatar ? <img src={partnerAvatar} alt={partnerName} /> : <span>{partInit}</span>}
           {partnerOnline && <span className="qp-avatar__dot" />}
         </div>
         <div className="qp-partner__text">
@@ -187,21 +232,15 @@ function QueuePanel({ currentTrack, deviceId, partnerName, partnerAvatar, partne
         {queue.length === 0 && (
           <div className="qp-empty"><p>Queue is empty</p><p>Search for songs to add</p></div>
         )}
-
         {queue.map((t, i) => (
           <div key={`${t.id}-${i}`} className="qp-track">
             <span className="qp-num">{i + 1}</span>
-            {/* normalized track: albumArt instead of album.images */}
             <img src={t.albumArt || ""} alt="" className="qp-art" loading="lazy" />
             <div className="qp-info">
               <p className="qp-name">{t.name}</p>
-              {/* normalized track: artists is already a string */}
               <p className="qp-artist">{t.artists}</p>
             </div>
-            <button
-              className="qp-play"
-              onClick={() => onTrackPlay?.(t, true)}  // true = already normalized
-            >▶</button>
+            <button className="qp-play" onClick={() => onTrackPlay?.(t, true)}>▶</button>
           </div>
         ))}
       </div>
@@ -209,20 +248,20 @@ function QueuePanel({ currentTrack, deviceId, partnerName, partnerAvatar, partne
   );
 }
 
-/* ════════════════════════════════════════════
+/* ══════════════════════════════════════════════════════════════════════════════
    MAIN ROOM
-════════════════════════════════════════════ */
+══════════════════════════════════════════════════════════════════════════════ */
 export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
-  // ── Data hooks ────────────────────────────────────────────────────────────
+
+  // ── Data hooks ─────────────────────────────────────────────────────────────
   const { track, progressMs, durationMs, profile, isPlaying } =
     useSpotify(spotifyToken);
 
-  const { deviceId, playerReady, playerError, volume, setVolume } =
+  // FIX 2: now also receives playerMode and isMobile
+  const { deviceId, playerReady, playerError, playerMode, isMobile: mobilePlayer, volume, setVolume } =
     useSpotifyPlayer(spotifyToken);
 
-  // ── Sync engine ───────────────────────────────────────────────────────────
-  // useSync owns all Spotify play/pause/seek/skip calls going to the partner.
-  // Room.jsx only calls controls.* — never calls spotifyPlay/Pause/Seek directly.
+  // ── Sync engine ────────────────────────────────────────────────────────────
   const { syncTrack, syncIsPlaying, controls } = useSync({
     roomId,
     accessToken: spotifyToken,
@@ -234,11 +273,30 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
     spotifyIsPlaying: isPlaying,
   });
 
-  // ── Shared queue ──────────────────────────────────────────────────────────
+  // ── Shared queue ───────────────────────────────────────────────────────────
   const { queue, addToQueue, removeFromQueue } = useQueue({ roomId });
 
-  // ── UI state ──────────────────────────────────────────────────────────────
-  // syncPlaying mirrors syncIsPlaying from useSync; partner-left can override it.
+  // FIX 3: Request room state on mount so queue + sync are populated immediately
+  useEffect(() => {
+    if (roomId) {
+      // Small delay to let Socket.io listeners register first
+      const t = setTimeout(() => socketService.requestRoomState(roomId), 300);
+      return () => clearTimeout(t);
+    }
+  }, [roomId]);
+
+  // Also re-request state when tab becomes visible again (handles background/foreground)
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && roomId) {
+        socketService.requestRoomState(roomId);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [roomId]);
+
+  // ── UI state ───────────────────────────────────────────────────────────────
   const [syncPlaying, setSyncPlaying] = useState(false);
   const [connStatus, setConnStatus] = useState("connecting");
   const [latency, setLatency] = useState(null);
@@ -267,7 +325,6 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
   // Keep syncPlaying in sync with useSync's authoritative state
   useEffect(() => { setSyncPlaying(syncIsPlaying); }, [syncIsPlaying]);
 
-  // Track session songs
   useEffect(() => {
     if (track?.id && track.id !== prevTrkRef.current) {
       prevTrkRef.current = track.id;
@@ -275,7 +332,6 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
     }
   }, [track?.id]);
 
-  // Heartbeat / listening timer
   useEffect(() => {
     if (syncPlaying && partnerOnline) {
       listenRef.current = setInterval(() => setListeningSecs(s => s + 1), 1000);
@@ -287,7 +343,7 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
     return () => clearInterval(listenRef.current);
   }, [syncPlaying, partnerOnline]);
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
+  // ── Helpers ────────────────────────────────────────────────────────────────
   const showToast = useCallback((text, type = "info") => {
     clearTimeout(toastRef.current);
     setToast({ text, type });
@@ -312,9 +368,8 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
     setTimeout(() => setCodeCopied(false), 2000);
   };
 
-  // ── Socket listeners ──────────────────────────────────────────────────────
-  // sync-play / sync-pause → UI state + toasts only.
-  // ALL Spotify API calls are handled inside useSync — not here.
+  // ── Socket listeners ───────────────────────────────────────────────────────
+  // UI state + toasts only; Spotify API calls live in useSync
   useEffect(() => {
     if (socketService.connected) setConnStatus("connected");
 
@@ -328,7 +383,6 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
       }),
       socketService.on("reconnect_attempt", () => setConnStatus("reconnecting")),
 
-      // Partner presence
       socketService.on("partner-joined", data => {
         setPartnerOnline(true);
         setPartnerName(data?.displayName ?? "Partner");
@@ -336,9 +390,10 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         setShowCodeCard(false);
         showToast(`${data?.displayName ?? "Partner"} joined 💕`, "join");
         celebrate();
-        // Re-request state so the new partner syncs to our current position
-        socketService.requestRoomState(roomId);
+        // Push current state to the new partner
+        setTimeout(() => socketService.requestRoomState(roomId), 200);
       }),
+
       socketService.on("partner-left", () => {
         setPartnerOnline(false);
         setPartnerPlaying(false);
@@ -346,9 +401,8 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         showToast(`${partnerName ?? "Partner"} left`, "leave");
       }),
 
-      // Sync events — UI side effects only, no Spotify calls (useSync owns those)
+      // UI effects for sync events — Spotify calls handled inside useSync
       socketService.on("sync-play", data => {
-        // Measure and display latency for the sync chip
         const lag = data?.serverTimestamp ? Date.now() - data.serverTimestamp : null;
         if (lag !== null && lag >= 0) setLatency(lag);
 
@@ -366,11 +420,9 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
 
       socketService.on("sync-pause", () => {
         setPartnerPlaying(false);
-        // syncIsPlaying from useSync will flip syncPlaying via the useEffect above
         showToast(`${partnerName ?? "Partner"} paused`, "pause");
       }),
 
-      // Reactions — unchanged
       socketService.on("reaction", ({ emoji } = {}) => {
         if (emoji) addReaction(emoji, true);
       }),
@@ -385,59 +437,86 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, partnerName, deviceId, spotifyToken]);
 
-  // ── Playback controls — all go through useSync ────────────────────────────
+  // ── Playback controls ──────────────────────────────────────────────────────
 
   const handlePlay = useCallback(async () => {
-    if (connStatus !== "connected" || syncPlaying || !track) return;
+    if (connStatus !== "connected" || syncPlaying) return;
+
+    // FIX 2: On mobile in "connect" mode, playerReady becomes true once
+    // a Spotify Connect device is found. No special branch needed.
+    if (!playerReady) {
+      showToast(
+        mobilePlayer
+          ? "Open Spotify on your phone first, then tap play 🎵"
+          : "Browser player not ready. Try refreshing.",
+        "info"
+      );
+      return;
+    }
+
+    if (!track) {
+      showToast("Search for a song to play 🔍", "info");
+      return;
+    }
+
     lastPlayRef.current = Date.now();
     await controls.play(normalizeSpotifyTrack(track), progressMs);
-  }, [connStatus, syncPlaying, track, progressMs, controls]);
+  }, [connStatus, syncPlaying, playerReady, track, progressMs, controls, showToast, mobilePlayer]);
 
   const handlePause = useCallback(async () => {
     if (connStatus !== "connected" || !syncPlaying) return;
     await controls.pause(track?.id, progressMs);
   }, [connStatus, syncPlaying, track, progressMs, controls]);
 
-  // Progress bar drag → seek both players
   const handleSeek = useCallback(async e => {
-    if (!durationMs || !track) return;
-    const pct = parseFloat(e.target.value); // 0–100
+    if (!durationMs || !track || !playerReady) return;
+    const pct = parseFloat(e.target.value);
     const positionMs = Math.round((pct / 100) * durationMs);
     await controls.seek(track.id, positionMs);
-  }, [durationMs, track, controls]);
+  }, [durationMs, track, playerReady, controls]);
 
-  // Called when user clicks "▶ Play" on a search result or a queue item
-  // alreadyNormalized = true when called from QueuePanel (track is already lean shape)
+  // Called from SearchPanel (▶ Play) or QueuePanel track row
+  // alreadyNormalized = true when track came from QueuePanel (lean shape)
   const handleTrackPlay = useCallback(async (t, alreadyNormalized = false) => {
+    if (!playerReady) {
+      showToast(
+        mobilePlayer ? "Open Spotify on your phone first 🎵" : "Player not ready",
+        "info"
+      );
+      return;
+    }
     const normalized = alreadyNormalized ? t : normalizeSpotifyTrack(t);
     await controls.play(normalized, 0);
     showToast(`Playing "${normalized.name}"`, "play");
-  }, [controls, showToast]);
+  }, [playerReady, controls, showToast, mobilePlayer]);
 
   const handleReaction = useCallback(emoji => {
     socketService.emitReaction(roomId, emoji);
     addReaction(emoji, false);
   }, [roomId, addReaction]);
 
-  // ── Derived display values ────────────────────────────────────────────────
+  // ── Derived display values ─────────────────────────────────────────────────
   const isConnected = connStatus === "connected";
   const albumArt = track?.album?.images?.[0]?.url ?? null;
   const trackName = track?.name ?? "Ready to Sync";
   const artistName = track?.artists?.map(a => a.name).join(", ") ?? "Open Spotify to start";
   const progressPct = durationMs > 0 ? Math.min((progressMs / durationMs) * 100, 100) : 0;
-  const myInit = profile?.name?.[0]?.toUpperCase() ?? "Y";
   const partInit = (partnerName?.[0] ?? "P").toUpperCase();
   const listenMin = Math.floor(listeningSecs / 60);
   const listenSec = listeningSecs % 60;
   const sync = syncLabel(latency);
-  const isPremium = playerReady;
-  const isFree = !playerReady && !!playerError;
+
+  // FIX 2: richer mode detection for chip display
+  const isSDK = playerMode === "sdk";
+  const isConnect = playerMode === "connect";
+  const isNone = !playerReady && (playerMode === "none" || playerMode === "initializing");
+
   const trackUri = track?.uri ?? null;
   const spotifyLink = trackUri
     ? `https://open.spotify.com/track/${trackUri.split(":")[2]}`
     : "https://open.spotify.com";
 
-  /* ── Shared player content ────────────────────────────────── */
+  /* ── Shared player content ────────────────────────────────────────────────── */
   const playerContent = (
     <div className="player-content">
       {/* Art */}
@@ -469,8 +548,8 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
       <div className="track-block">
         <div className="track-chips">
           {sync && <span className={`chip ${sync.cls}`}>{sync.text}</span>}
-          {isPremium && <span className="chip chip--device">▶ Duo-fy Web</span>}
-          {isFree && <span className="chip chip--free">♫ Spotify App</span>}
+          {isSDK && <span className="chip chip--device">▶ Duo-fy Web</span>}
+          {isConnect && <span className="chip chip--free">📱 Spotify Connect</span>}
         </div>
         <h2 className="track-name">{trackName}</h2>
         <p className="track-artist">{artistName}</p>
@@ -530,7 +609,7 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         </div>
       </div>
 
-      {/* Controls — skip-next goes through useSync (server advances queue) */}
+      {/* Controls */}
       <div className="controls">
         <button
           className="ctrl ctrl--sm"
@@ -566,8 +645,19 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         <VolMax />
       </div>
 
-      {/* Free user nudge */}
-      {isFree && (
+      {/* FIX 2: Mobile "none" state — clear CTA to open Spotify app */}
+      {isNone && mobilePlayer && (
+        <div className="mobile-cta">
+          <p className="mobile-cta__text">
+            Open the <strong>Spotify app</strong> on this device, start playing any song,
+            then come back here to sync with your partner 🎵
+          </p>
+          <a href="spotify:" className="mobile-cta__btn">Open Spotify</a>
+        </div>
+      )}
+
+      {/* Desktop fallback — Spotify Premium required */}
+      {isNone && !mobilePlayer && playerError && (
         <a href={spotifyLink} target="_blank" rel="noopener noreferrer" className="open-spotify">
           Open in Spotify App ↗
         </a>
@@ -613,7 +703,7 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         </div>
       )}
 
-      {/* ── TOPBAR ──────────────────────────────────────── */}
+      {/* ── TOPBAR ──────────────────────────────────────────── */}
       <header className="topbar">
         <a href="/" className="topbar-brand">
           <HpIcon />
@@ -642,7 +732,7 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         </div>
       </header>
 
-      {/* ── ROOM CODE BANNER ────────────────────────────── */}
+      {/* ── ROOM CODE BANNER ────────────────────────────────── */}
       {showCodeCard && (
         <div className="code-banner">
           <p className="code-banner__label">Invite your partner</p>
@@ -658,18 +748,13 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         </div>
       )}
 
-      {/* ── DESKTOP 3-COLUMN ────────────────────────────── */}
+      {/* ── DESKTOP 3-COLUMN ────────────────────────────────── */}
       <div className="desk-layout">
         <aside className="desk-left">
           <QueuePanel
             currentTrack={track}
-            deviceId={deviceId}
-            partnerName={partnerName}
-            partnerAvatar={partnerAvatar}
-            partnerOnline={partnerOnline}
-            queue={queue}
-            onRemove={removeFromQueue}
-            onTrackPlay={handleTrackPlay}
+            partnerName={partnerName} partnerAvatar={partnerAvatar} partnerOnline={partnerOnline}
+            queue={queue} onRemove={removeFromQueue} onTrackPlay={handleTrackPlay}
           />
         </aside>
         <main className="desk-center">
@@ -679,17 +764,16 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         <aside className="desk-right">
           <SearchPanel
             accessToken={spotifyToken}
-            deviceId={deviceId}
             onTrackPlay={handleTrackPlay}
             onAddToQueue={addToQueue}
           />
         </aside>
       </div>
 
-      {/* ── MOBILE PANELS ───────────────────────────────── */}
+      {/* ── MOBILE PANELS ───────────────────────────────────── */}
       <div className={`mob-panel ${mobileTab === "queue" ? "mob-panel--show" : ""}`}>
         <QueuePanel
-          currentTrack={track} deviceId={deviceId}
+          currentTrack={track}
           partnerName={partnerName} partnerAvatar={partnerAvatar} partnerOnline={partnerOnline}
           queue={queue} onRemove={removeFromQueue} onTrackPlay={handleTrackPlay}
         />
@@ -703,7 +787,6 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
       <div className={`mob-panel ${mobileTab === "search" ? "mob-panel--show" : ""}`}>
         <SearchPanel
           accessToken={spotifyToken}
-          deviceId={deviceId}
           onTrackPlay={handleTrackPlay}
           onAddToQueue={addToQueue}
         />
@@ -732,7 +815,7 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
         </div>
       )}
 
-      {/* ── SESSION SUMMARY ─────────────────────────────── */}
+      {/* ── SESSION SUMMARY ─────────────────────────────────── */}
       {showSummary && (
         <div className="sum-overlay" onClick={e => e.target === e.currentTarget && setShowSummary(false)}>
           <div className="sum-sheet">
@@ -771,7 +854,7 @@ export default function Room({ roomId, onLeaveRoom, spotifyToken }) {
   );
 }
 
-/* ── Icons (unchanged) ─────────────────────────────────────── */
+/* ── Icons (unchanged) ────────────────────────────────────────────────────── */
 const HpIcon = () => (<svg width="22" height="22" viewBox="0 0 22 22" fill="none"><path d="M4 13a2 2 0 012-2h1a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm9 0a2 2 0 012-2h1a2 2 0 012 2v2a2 2 0 01-2 2h-1a2 2 0 01-2-2v-2z" fill="url(#hp)" /><path d="M4 13A7 7 0 0118 13" stroke="url(#hp)" strokeWidth="2" strokeLinecap="round" fill="none" /><defs><linearGradient id="hp" x1="4" y1="8" x2="18" y2="17" gradientUnits="userSpaceOnUse"><stop stopColor="#FF4FA3" /><stop offset="1" stopColor="#B38CFF" /></linearGradient></defs></svg>);
 const PlayIcon = () => <svg width="28" height="28" viewBox="0 0 28 28" fill="currentColor"><path d="M5 3.5l19 10.5L5 24.5V3.5z" /></svg>;
 const PauseIcon = () => <svg width="28" height="28" viewBox="0 0 28 28" fill="currentColor"><rect x="4" y="4" width="7" height="20" rx="2" /><rect x="17" y="4" width="7" height="20" rx="2" /></svg>;

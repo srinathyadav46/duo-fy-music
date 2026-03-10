@@ -1,14 +1,13 @@
 /**
- * server.js — Duo-fy Backend v2
+ * server.js — Duo-fy Backend v2.1
  *
- * New in v2:
- * - Per-room state machine  (track, position, isPlaying, queue, updatedAt)
- * - Rich control events: play / pause / seek / skip — all carry track + position
- * - Server timestamps on every sync broadcast so clients correct for network lag
- * - Shared queue: queue-add, queue-remove, auto-advance on track-ended
- * - room-state snapshot delivered to joining / reconnecting users
- * - Clock-offset ping/pong so clients can measure their own latency
- * - All existing OAuth routes & reactions kept intact
+ * ROOT CAUSE FIXED:
+ *  join-room returned roomState only in the acknowledgement callback.
+ *  useQueue and useSync listen for the "room-state" SOCKET EVENT, not the
+ *  callback payload — so joining users never received the initial queue/track.
+ *
+ *  Fix: after a socket joins a room, emit "room-state" directly to that socket
+ *  in addition to returning it in the callback. Both hooks now auto-populate.
  */
 
 import express from "express";
@@ -119,6 +118,17 @@ function getEffectivePosition(state) {
   return state.positionMs + (Date.now() - state.updatedAt);
 }
 
+// Build the room-state payload that both hooks consume
+function buildStatePayload(state) {
+  return {
+    currentTrack: state.currentTrack,
+    positionMs: getEffectivePosition(state),
+    isPlaying: state.isPlaying,
+    queue: state.queue,
+    serverTimestamp: Date.now(),
+  };
+}
+
 // ─── Health Check ─────────────────────────────────────────────────────────────
 
 app.get("/health", (_req, res) => {
@@ -126,7 +136,7 @@ app.get("/health", (_req, res) => {
 });
 
 /* ══════════════════════════════════════════════════════════════════════════════
-   Spotify OAuth  (unchanged from v1)
+   Spotify OAuth
 ══════════════════════════════════════════════════════════════════════════════ */
 
 app.get("/login", (_req, res) => {
@@ -163,7 +173,6 @@ app.get("/callback", async (req, res) => {
       new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: SPOTIFY_REDIRECT_URI }),
       { headers: { Authorization: spotifyAuthHeader(), "Content-Type": "application/x-www-form-urlencoded" } }
     );
-
     const { access_token, refresh_token, expires_in } = response.data;
     res.redirect(
       `${FRONTEND_URL}/?access_token=${access_token}` +
@@ -204,9 +213,6 @@ io.on("connection", (socket) => {
   let currentRoom = null;
 
   // ── Clock Sync Ping ────────────────────────────────────────────────────────
-  // Clients send a ping with their local timestamp; the server echoes it back
-  // with a server timestamp. Clients use the round-trip time to estimate their
-  // own clock offset: offset = serverTimestamp - (clientSent + RTT/2)
   socket.on("ping-sync", ({ clientTimestamp } = {}) => {
     socket.emit("pong-sync", {
       clientTimestamp,
@@ -246,35 +252,32 @@ io.on("connection", (socket) => {
 
     socket.to(roomId).emit("partner-joined");
 
-    // Deliver current room state so the joiner can sync immediately.
-    // positionMs is projected forward from the last known state update.
     const state = getRoomState(roomId);
+
+    // ▼▼▼ THE KEY FIX ▼▼▼
+    // Emit "room-state" directly to the joining socket AS A SOCKET EVENT
+    // (not just in the callback). useSync and useQueue both listen for this
+    // event and use it to populate their initial state.
+    if (state) {
+      socket.emit("room-state", buildStatePayload(state));
+    }
+
+    // Also return it in the callback for backward-compat with App.jsx
     callback({
       success: true,
       roomId,
-      roomState: state ? {
-        currentTrack: state.currentTrack,
-        positionMs: getEffectivePosition(state),
-        isPlaying: state.isPlaying,
-        queue: state.queue,
-        serverTimestamp: Date.now(),
-      } : null,
+      roomState: state ? buildStatePayload(state) : null,
     });
   });
 
-  // ── Request State  (reconnect / tab visibility restore) ───────────────────
+  // ── Request State  (reconnect / tab restore / partner-joined) ─────────────
   socket.on("request-state", ({ roomId } = {}) => {
     if (!roomId || !socket.rooms.has(roomId)) return;
     const state = getRoomState(roomId);
     if (!state) return;
 
-    socket.emit("room-state", {
-      currentTrack: state.currentTrack,
-      positionMs: getEffectivePosition(state),
-      isPlaying: state.isPlaying,
-      queue: state.queue,
-      serverTimestamp: Date.now(),
-    });
+    log("info", `State requested by ${socket.id} for room ${roomId}`);
+    socket.emit("room-state", buildStatePayload(state));
   });
 
   // ── Leave Room ─────────────────────────────────────────────────────────────
@@ -291,19 +294,7 @@ io.on("connection", (socket) => {
   });
 
   // ── Playback Control ───────────────────────────────────────────────────────
-  //
-  // Unified "control" event payload:
-  // {
-  //   event      : "play" | "pause" | "seek" | "skip"
-  //   roomId     : string
-  //   track?     : Track     — required for "play" (new track)
-  //   trackId?   : string    — for "pause"/"seek" (stale-event guard)
-  //   positionMs?: number    — position at the moment the action fired
-  // }
-  //
-  // Server rebroadcasts to the PARTNER only (sender already acted locally)
-  // for play/pause/seek, and to BOTH for skip (authoritative queue advance).
-
+  // Payload: { event, roomId, track?, trackId?, positionMs? }
   socket.on("control", (payload = {}) => {
     const { event, roomId, track, trackId, positionMs = 0 } = payload;
 
@@ -330,17 +321,16 @@ io.on("connection", (socket) => {
         updatedAt: serverTimestamp,
       });
 
+      // Broadcast to partner only — sender already played locally
       socket.to(roomId).emit("sync-play", {
-        track: resolvedTrack,
-        positionMs,
-        serverTimestamp,
+        track: resolvedTrack, positionMs, serverTimestamp,
       });
 
       log("info", `sync-play → room ${roomId} | "${resolvedTrack.name}" @ ${positionMs}ms`);
     }
 
     else if (event === "pause") {
-      if (trackId && state.currentTrack?.id !== trackId) return; // stale
+      if (trackId && state.currentTrack?.id !== trackId) return;
 
       Object.assign(state, {
         positionMs,
@@ -349,9 +339,7 @@ io.on("connection", (socket) => {
       });
 
       socket.to(roomId).emit("sync-pause", {
-        trackId: state.currentTrack?.id,
-        positionMs,
-        serverTimestamp,
+        trackId: state.currentTrack?.id, positionMs, serverTimestamp,
       });
 
       log("info", `sync-pause → room ${roomId} @ ${positionMs}ms`);
@@ -360,16 +348,10 @@ io.on("connection", (socket) => {
     else if (event === "seek") {
       if (trackId && state.currentTrack?.id !== trackId) return;
 
-      Object.assign(state, {
-        positionMs,
-        updatedAt: serverTimestamp,
-        // isPlaying unchanged — seek doesn't toggle play/pause
-      });
+      Object.assign(state, { positionMs, updatedAt: serverTimestamp });
 
       socket.to(roomId).emit("sync-seek", {
-        trackId: state.currentTrack?.id,
-        positionMs,
-        serverTimestamp,
+        trackId: state.currentTrack?.id, positionMs, serverTimestamp,
       });
 
       log("info", `sync-seek → room ${roomId} @ ${positionMs}ms`);
@@ -384,13 +366,9 @@ io.on("connection", (socket) => {
 
       const nextTrack = state.queue.shift();
       Object.assign(state, {
-        currentTrack: nextTrack,
-        positionMs: 0,
-        isPlaying: true,
-        updatedAt: serverTimestamp,
+        currentTrack: nextTrack, positionMs: 0, isPlaying: true, updatedAt: serverTimestamp,
       });
 
-      // Broadcast to BOTH so they start the same next track in unison
       io.to(roomId).emit("sync-play", { track: nextTrack, positionMs: 0, serverTimestamp, fromQueue: true });
       io.to(roomId).emit("queue-updated", { queue: state.queue, serverTimestamp });
 
@@ -399,14 +377,13 @@ io.on("connection", (socket) => {
   });
 
   // ── Track Ended (auto-advance) ─────────────────────────────────────────────
-  // Either client may emit this. Server deduplicates via trackId comparison.
   // { roomId, trackId }
   socket.on("track-ended", ({ roomId, trackId } = {}) => {
     if (!roomId || !socket.rooms.has(roomId)) return;
 
     const state = getRoomState(roomId);
     if (!state) return;
-    if (state.currentTrack?.id !== trackId) return; // already advanced or stale
+    if (state.currentTrack?.id !== trackId) return; // stale or already advanced
 
     const serverTimestamp = Date.now();
 
@@ -419,10 +396,7 @@ io.on("connection", (socket) => {
 
     const nextTrack = state.queue.shift();
     Object.assign(state, {
-      currentTrack: nextTrack,
-      positionMs: 0,
-      isPlaying: true,
-      updatedAt: serverTimestamp,
+      currentTrack: nextTrack, positionMs: 0, isPlaying: true, updatedAt: serverTimestamp,
     });
 
     io.to(roomId).emit("sync-play", { track: nextTrack, positionMs: 0, serverTimestamp, fromQueue: true });
@@ -431,9 +405,8 @@ io.on("connection", (socket) => {
     log("info", `Auto-advance → "${nextTrack.name}" in room ${roomId}`);
   });
 
-  // ── Queue Management ───────────────────────────────────────────────────────
+  // ── Queue ──────────────────────────────────────────────────────────────────
 
-  // queue-add: { roomId, track }
   socket.on("queue-add", ({ roomId, track } = {}) => {
     if (!roomId || !track?.id || !track?.uri) return;
     if (!socket.rooms.has(roomId)) return;
@@ -443,7 +416,7 @@ io.on("connection", (socket) => {
 
     state.queue.push(track);
 
-    // If nothing is playing, start this track immediately for both users
+    // Auto-start if nothing is currently playing
     if (!state.currentTrack) {
       const serverTimestamp = Date.now();
       const first = state.queue.shift();
@@ -452,10 +425,9 @@ io.on("connection", (socket) => {
     }
 
     io.to(roomId).emit("queue-updated", { queue: state.queue, serverTimestamp: Date.now() });
-    log("info", `queue-add: "${track.name}" → room ${roomId}`);
+    log("info", `queue-add: "${track.name}" → room ${roomId} (queue length: ${state.queue.length})`);
   });
 
-  // queue-remove: { roomId, index }
   socket.on("queue-remove", ({ roomId, index } = {}) => {
     if (!roomId || index == null) return;
     if (!socket.rooms.has(roomId)) return;
@@ -468,10 +440,9 @@ io.on("connection", (socket) => {
     log("info", `queue-remove: "${removed?.name}" at [${index}] in room ${roomId}`);
   });
 
-  // ── Reactions  (unchanged — kept for compatibility) ────────────────────────
+  // ── Reactions ──────────────────────────────────────────────────────────────
   socket.on("reaction", ({ roomId, emoji, timestamp } = {}) => {
-    if (!roomId || !emoji) return;
-    if (!socket.rooms.has(roomId)) return;
+    if (!roomId || !emoji || !socket.rooms.has(roomId)) return;
     socket.to(roomId).emit("reaction", { emoji, timestamp: timestamp ?? Date.now() });
   });
 

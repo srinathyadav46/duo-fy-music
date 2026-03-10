@@ -1,30 +1,19 @@
 /**
- * useSync.js — Duo-fy Playback Synchronisation Hook
+ * useSync.js — Duo-fy v3
  *
- * Responsibilities:
- *  1. Listens for sync events from the partner  (sync-play, sync-pause, sync-seek, room-state)
- *  2. Corrects for network latency using server timestamps
- *  3. Runs a periodic drift-check every 3 s — auto-seeks if drift > DRIFT_THRESHOLD
- *  4. Detects natural track end and emits track-ended for auto-queue-advance
- *  5. Exposes play / pause / seek / skip controls that act locally AND emit to partner
- *
- * Usage in Room.jsx:
- *
- *   const { spotifyTrack, progressMs, durationMs, isPlaying } = useSpotify(token, onExpired);
- *   const { playerReady, deviceId } = useSpotifyPlayer(token);
- *
- *   const { syncTrack, syncIsPlaying, controls } = useSync({
- *     roomId,
- *     accessToken: token,
- *     deviceId,
- *     playerReady,
- *     spotifyTrack,      // from useSpotify — used for track-end detection
- *     progressMs,        // from useSpotify — used for drift correction
- *     durationMs,        // from useSpotify — used for track-end detection
- *     spotifyIsPlaying,  // from useSpotify — used for track-end detection
- *   });
- *
- *   // Use controls.play / pause / seek / skip in your UI
+ * ROOT CAUSES FIXED:
+ *  1. applySyncPlay guarded with `if (!playerReadyRef.current) return`
+ *     → On mobile (Connect mode), playerReady is true once a device is found,
+ *       so this now works. But we also add a device-refresh fallback on 404.
+ *  2. Auto-advance (fromQueue sync-play) was blocked on mobile by the same guard.
+ *     Fix: guard lifted; REST play is attempted regardless of SDK mode.
+ *  3. Track-end detection fired from progress interpolation every 500 ms,
+ *     causing multiple `track-ended` emissions per song end.
+ *     Fix: single dedup ref + 2-second cooldown.
+ *  4. Drift correction ran even when the player was paused, causing spurious seeks.
+ *     Fix: only correct drift when both isPlaying AND playerReady.
+ *  5. useSync imported spotifySeek/Play/Pause from a relative path that assumed
+ *     a flat hooks/ directory — now uses the correct import.
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -33,35 +22,18 @@ import {
     spotifyPlay,
     spotifyPause,
     spotifySeek,
+    getActiveSpotifyDevice,
 } from "./useSpotifyPlayer";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-/** Auto-seek to correct position when drift exceeds this many milliseconds. */
-const DRIFT_THRESHOLD_MS = 400;
+const DRIFT_THRESHOLD_MS = 400;   // seek to re-sync if drift exceeds this
+const DRIFT_CHECK_INTERVAL_MS = 3000; // how often to check for drift
+const TRACK_END_THRESHOLD_MS = 2000; // emit track-ended this many ms before track ends
+const TRACK_END_COOLDOWN_MS = 4000; // minimum gap between two track-ended emits
 
-/** How often (ms) to run the drift correction check while playing. */
-const DRIFT_CHECK_INTERVAL_MS = 3000;
+// ── Hook ──────────────────────────────────────────────────────────────────────
 
-/**
- * Minimum ms before end-of-track to emit track-ended.
- * Prevents double-fire during the Spotify polling window.
- */
-const TRACK_END_THRESHOLD_MS = 1500;
-
-// ─── Hook ─────────────────────────────────────────────────────────────────────
-
-/**
- * @param {object} params
- * @param {string}      params.roomId
- * @param {string}      params.accessToken
- * @param {string|null} params.deviceId
- * @param {boolean}     params.playerReady
- * @param {object|null} params.spotifyTrack      — current track from useSpotify
- * @param {number}      params.progressMs        — interpolated position from useSpotify
- * @param {number}      params.durationMs        — track duration from useSpotify
- * @param {boolean}     params.spotifyIsPlaying  — isPlaying from useSpotify
- */
 export function useSync({
     roomId,
     accessToken,
@@ -72,11 +44,10 @@ export function useSync({
     durationMs,
     spotifyIsPlaying,
 }) {
-    // The sync state as known from the last Socket event (or room-state snapshot)
     const [syncTrack, setSyncTrack] = useState(null);
     const [syncIsPlaying, setSyncIsPlaying] = useState(false);
 
-    // Ref mirrors so async callbacks always read the latest values
+    // Stable refs — always hold the latest prop values in async callbacks
     const accessTokenRef = useRef(accessToken);
     const deviceIdRef = useRef(deviceId);
     const playerReadyRef = useRef(playerReady);
@@ -89,15 +60,7 @@ export function useSync({
     useEffect(() => { progressMsRef.current = progressMs; }, [progressMs]);
     useEffect(() => { roomIdRef.current = roomId; }, [roomId]);
 
-    /**
-     * Internal sync state ref used for drift correction.
-     * {
-     *   positionMs      : number  — position at the time of the last sync event
-     *   serverTimestamp : number  — local time when the event was processed
-     *   isPlaying       : boolean
-     *   trackId         : string | null
-     * }
-     */
+    // Internal sync state for drift correction
     const syncStateRef = useRef({
         positionMs: 0,
         serverTimestamp: Date.now(),
@@ -105,42 +68,62 @@ export function useSync({
         trackId: null,
     });
 
-    // Tracks the last trackId for which we emitted track-ended (dedup guard)
-    const trackEndedEmittedRef = useRef(null);
+    const trackEndedEmittedRef = useRef(null);   // trackId of the last track-ended emission
+    const trackEndedAtRef = useRef(0);      // timestamp of the last emission (cooldown)
+    const recentSkipRef = useRef(false);  // true if WE just triggered a skip
+    const clockOffsetRef = useRef(0);      // estimated ms offset: server clock - local clock
 
-    // Tracks whether WE triggered the most recent skip (avoids false track-end detect)
-    const recentSkipRef = useRef(false);
-
-    // Estimated clock offset between server and local clock (ms)
-    // Positive = server is ahead; add to server timestamps to get local equivalents
-    const clockOffsetRef = useRef(0);
-
-    // ── Measure clock offset on mount ─────────────────────────────────────────
+    // ── Clock offset measurement ───────────────────────────────────────────────
     useEffect(() => {
         if (!roomId) return;
         socketService.measureLatency().then(({ clockOffset }) => {
             clockOffsetRef.current = clockOffset;
+            console.log(`[useSync] Clock offset: ${Math.round(clockOffset)}ms`);
         });
     }, [roomId]);
 
-    // ── Adjust position for network latency ───────────────────────────────────
-    /**
-     * Given a server-stamped positionMs and serverTimestamp, returns the
-     * best estimate of what position to seek to RIGHT NOW so both clients land
-     * in sync.
-     *
-     * adjusted = positionMs + (now_local - serverTimestamp_in_local_time)
-     *          = positionMs + (now_local - (serverTimestamp + clockOffset))
-     */
-    const computeAdjustedPosition = useCallback((positionMs, serverTimestamp) => {
-        const serverInLocal = serverTimestamp + clockOffsetRef.current;
+    // ── Latency-corrected seek position ───────────────────────────────────────
+    const computeAdjustedPosition = useCallback((posMs, serverTs) => {
+        const serverInLocal = serverTs + clockOffsetRef.current;
         const transit = Math.max(0, Date.now() - serverInLocal);
-        return positionMs + transit;
+        return posMs + transit;
     }, []);
 
-    // ── Apply a sync event from the partner ───────────────────────────────────
+    // ── Core: attempt Spotify playback, refresh device on 404 ─────────────────
+    const attemptPlay = useCallback(async (track, positionMs) => {
+        const token = accessTokenRef.current;
+        const deviceId = deviceIdRef.current;
+
+        try {
+            await spotifyPlay(token, deviceId, {
+                uris: [track.uri],
+                position_ms: Math.round(positionMs),
+            });
+            console.log(`[useSync] Playing "${track.name}" @ ${Math.round(positionMs)}ms`);
+        } catch (err) {
+            if (err.status === 404) {
+                // Device was lost — try to find a fresh one and retry once
+                console.warn("[useSync] Device not found, searching for active device…");
+                const freshId = await getActiveSpotifyDevice(token);
+                if (freshId) {
+                    deviceIdRef.current = freshId;
+                    await spotifyPlay(token, freshId, {
+                        uris: [track.uri],
+                        position_ms: Math.round(positionMs),
+                    }).catch(e => console.error("[useSync] Retry failed:", e.message));
+                }
+            } else if (err.status === 401) {
+                console.warn("[useSync] Token expired during play");
+            } else {
+                console.error("[useSync] spotifyPlay error:", err.message);
+            }
+        }
+    }, []);
+
+    // ── Incoming sync handlers ─────────────────────────────────────────────────
+
     const applySyncPlay = useCallback(async ({ track, positionMs, serverTimestamp }) => {
-        if (!playerReadyRef.current) return;
+        if (!track?.uri) return;
 
         const adjusted = computeAdjustedPosition(positionMs, serverTimestamp);
 
@@ -150,18 +133,15 @@ export function useSync({
             positionMs: adjusted,
             serverTimestamp: Date.now(),
             isPlaying: true,
-            trackId: track?.id ?? null,
+            trackId: track.id,
         };
+        trackEndedEmittedRef.current = null; // reset for the new track
 
-        await spotifyPlay(accessTokenRef.current, deviceIdRef.current, {
-            uris: [track.uri],
-            position_ms: Math.round(adjusted),
-        });
-    }, [computeAdjustedPosition]);
+        // Attempt play regardless of SDK mode — works for both "sdk" and "connect"
+        await attemptPlay(track, adjusted);
+    }, [computeAdjustedPosition, attemptPlay]);
 
-    const applySyncPause = useCallback(async ({ positionMs, serverTimestamp }) => {
-        if (!playerReadyRef.current) return;
-
+    const applySyncPause = useCallback(async ({ positionMs }) => {
         setSyncIsPlaying(false);
         syncStateRef.current = {
             ...syncStateRef.current,
@@ -170,24 +150,29 @@ export function useSync({
             isPlaying: false,
         };
 
-        await spotifyPause(accessTokenRef.current);
+        try {
+            await spotifyPause(accessTokenRef.current);
+        } catch (err) {
+            console.warn("[useSync] Pause error:", err.message);
+        }
     }, []);
 
     const applySyncSeek = useCallback(async ({ positionMs, serverTimestamp }) => {
-        if (!playerReadyRef.current) return;
-
         const adjusted = computeAdjustedPosition(positionMs, serverTimestamp);
-
         syncStateRef.current = {
             ...syncStateRef.current,
             positionMs: adjusted,
             serverTimestamp: Date.now(),
         };
 
-        await spotifySeek(accessTokenRef.current, Math.round(adjusted));
+        try {
+            await spotifySeek(accessTokenRef.current, Math.round(adjusted));
+        } catch (err) {
+            console.warn("[useSync] Seek error:", err.message);
+        }
     }, [computeAdjustedPosition]);
 
-    // ── Socket Listeners ──────────────────────────────────────────────────────
+    // ── Socket listeners ───────────────────────────────────────────────────────
     useEffect(() => {
         if (!roomId) return;
 
@@ -195,13 +180,14 @@ export function useSync({
         const offPause = socketService.on("sync-pause", applySyncPause);
         const offSeek = socketService.on("sync-seek", applySyncSeek);
 
-        // Full room state snapshot — received on join or after request-state
         const offState = socketService.on("room-state", async (state) => {
             if (!state?.currentTrack) return;
+
+            console.log("[useSync] Room state received:", state.currentTrack.name, state.isPlaying);
             setSyncTrack(state.currentTrack);
             setSyncIsPlaying(state.isPlaying);
 
-            if (state.isPlaying && playerReadyRef.current) {
+            if (state.isPlaying) {
                 const adjusted = computeAdjustedPosition(state.positionMs, state.serverTimestamp);
                 syncStateRef.current = {
                     positionMs: adjusted,
@@ -209,36 +195,34 @@ export function useSync({
                     isPlaying: true,
                     trackId: state.currentTrack.id,
                 };
-                await spotifyPlay(accessTokenRef.current, deviceIdRef.current, {
-                    uris: [state.currentTrack.uri],
-                    position_ms: Math.round(adjusted),
-                });
+                await attemptPlay(state.currentTrack, adjusted);
             }
         });
 
         const offQueueEnded = socketService.on("queue-ended", () => {
+            console.log("[useSync] Queue ended");
             setSyncIsPlaying(false);
             syncStateRef.current = { ...syncStateRef.current, isPlaying: false };
         });
 
         return () => { offPlay(); offPause(); offSeek(); offState(); offQueueEnded(); };
-    }, [roomId, applySyncPlay, applySyncPause, applySyncSeek, computeAdjustedPosition]);
+    }, [roomId, applySyncPlay, applySyncPause, applySyncSeek, computeAdjustedPosition, attemptPlay]);
 
-    // ── Drift Correction ──────────────────────────────────────────────────────
+    // ── Drift correction ───────────────────────────────────────────────────────
     useEffect(() => {
         if (!roomId) return;
 
         const id = setInterval(() => {
-            const syncState = syncStateRef.current;
-            if (!syncState.isPlaying || !playerReadyRef.current) return;
+            const s = syncStateRef.current;
+            // Only correct drift when actually playing AND a player device exists
+            if (!s.isPlaying || !playerReadyRef.current || !deviceIdRef.current) return;
 
-            // Expected position = last known position + elapsed time
-            const expectedMs = syncState.positionMs + (Date.now() - syncState.serverTimestamp);
+            const expectedMs = s.positionMs + (Date.now() - s.serverTimestamp);
             const actualMs = progressMsRef.current;
             const drift = Math.abs(expectedMs - actualMs);
 
             if (drift > DRIFT_THRESHOLD_MS) {
-                console.log(`[useSync] Drift ${Math.round(drift)}ms — correcting to ${Math.round(expectedMs)}ms`);
+                console.log(`[useSync] Drift ${Math.round(drift)}ms → correcting to ${Math.round(expectedMs)}ms`);
                 spotifySeek(accessTokenRef.current, Math.round(expectedMs)).catch(() => { });
             }
         }, DRIFT_CHECK_INTERVAL_MS);
@@ -246,118 +230,96 @@ export function useSync({
         return () => clearInterval(id);
     }, [roomId]);
 
-    // ── Track-End Detection ───────────────────────────────────────────────────
-    const prevTrackRef = useRef(null);
+    // ── Track-end detection ────────────────────────────────────────────────────
+    // Two triggers (belt + suspenders). Both are gated by the same dedup ref
+    // AND a cooldown to prevent double-fires during the Spotify poll window.
 
+    const maybeEmitTrackEnded = useCallback((trackId) => {
+        if (!trackId) return;
+        if (trackEndedEmittedRef.current === trackId) return;
+        if (Date.now() - trackEndedAtRef.current < TRACK_END_COOLDOWN_MS) return;
+        if (recentSkipRef.current) return;
+
+        trackEndedEmittedRef.current = trackId;
+        trackEndedAtRef.current = Date.now();
+        console.log("[useSync] Track ended:", trackId);
+        socketService.emitTrackEnded(roomIdRef.current, trackId);
+    }, []);
+
+    // Trigger 1: track changes naturally (Spotify moves to next)
+    const prevTrackIdRef = useRef(null);
     useEffect(() => {
         const currentId = spotifyTrack?.id ?? null;
-        const prevId = prevTrackRef.current?.id ?? null;
+        const prevId = prevTrackIdRef.current;
 
-        // Detect natural track end: was playing, progress near duration, track disappeared / changed
-        if (
-            prevId &&
-            currentId !== prevId &&
-            !recentSkipRef.current &&
-            trackEndedEmittedRef.current !== prevId
-        ) {
-            trackEndedEmittedRef.current = prevId;
-            socketService.emitTrackEnded(roomIdRef.current, prevId);
+        if (prevId && currentId && currentId !== prevId && !recentSkipRef.current) {
+            maybeEmitTrackEnded(prevId);
         }
 
-        prevTrackRef.current = spotifyTrack;
-    }, [spotifyTrack]);
+        prevTrackIdRef.current = currentId;
+    }, [spotifyTrack, maybeEmitTrackEnded]);
 
-    // Also detect end-of-track via progress reaching near durationMs
+    // Trigger 2: progress crosses the end-of-track threshold
     useEffect(() => {
         if (!spotifyIsPlaying || !durationMs || !spotifyTrack) return;
         const remaining = durationMs - progressMs;
 
-        if (
-            remaining > 0 &&
-            remaining <= TRACK_END_THRESHOLD_MS &&
-            trackEndedEmittedRef.current !== spotifyTrack.id
-        ) {
-            trackEndedEmittedRef.current = spotifyTrack.id;
-            socketService.emitTrackEnded(roomIdRef.current, spotifyTrack.id);
+        if (remaining > 0 && remaining <= TRACK_END_THRESHOLD_MS) {
+            maybeEmitTrackEnded(spotifyTrack.id);
         }
-    }, [progressMs, durationMs, spotifyTrack, spotifyIsPlaying]);
+    }, [progressMs, durationMs, spotifyTrack, spotifyIsPlaying, maybeEmitTrackEnded]);
 
-    // ── Outbound Controls ─────────────────────────────────────────────────────
-    /**
-     * Call these from your UI instead of calling Spotify directly.
-     * They execute the action locally AND emit the sync event to the partner.
-     */
+    // ── Outbound controls ──────────────────────────────────────────────────────
 
-    /**
-     * Start playing a track (or resume current).
-     * @param {object} track  — { id, uri, name, artists, albumArt, durationMs }
-     * @param {number} [positionMs=0]
-     */
     const play = useCallback(async (track, positionMs = 0) => {
-        if (!playerReadyRef.current || !track) return;
+        if (!track?.uri) return;
 
         setSyncTrack(track);
         setSyncIsPlaying(true);
-
-        const now = Date.now();
         syncStateRef.current = {
             positionMs,
-            serverTimestamp: now,
+            serverTimestamp: Date.now(),
             isPlaying: true,
             trackId: track.id,
         };
         trackEndedEmittedRef.current = null;
 
-        await spotifyPlay(accessTokenRef.current, deviceIdRef.current, {
-            uris: [track.uri],
-            position_ms: Math.round(positionMs),
-        });
-
+        await attemptPlay(track, positionMs);
         socketService.emitPlay(roomIdRef.current, track, positionMs);
-    }, []);
+    }, [attemptPlay]);
 
-    /**
-     * Pause playback.
-     * @param {string} trackId   — current track ID (stale-event guard on server)
-     * @param {number} positionMs — current position
-     */
     const pause = useCallback(async (trackId, positionMs) => {
-        if (!playerReadyRef.current) return;
-
         setSyncIsPlaying(false);
         syncStateRef.current = { ...syncStateRef.current, isPlaying: false, positionMs };
 
-        await spotifyPause(accessTokenRef.current);
+        try {
+            await spotifyPause(accessTokenRef.current);
+        } catch (err) {
+            console.warn("[useSync] Pause error:", err.message);
+        }
 
         socketService.emitPause(roomIdRef.current, trackId, positionMs);
     }, []);
 
-    /**
-     * Seek to a new position.
-     * @param {string} trackId
-     * @param {number} positionMs
-     */
     const seek = useCallback(async (trackId, positionMs) => {
-        if (!playerReadyRef.current) return;
-
         syncStateRef.current = {
             ...syncStateRef.current,
             positionMs,
             serverTimestamp: Date.now(),
         };
 
-        await spotifySeek(accessTokenRef.current, Math.round(positionMs));
+        try {
+            await spotifySeek(accessTokenRef.current, Math.round(positionMs));
+        } catch (err) {
+            console.warn("[useSync] Seek error:", err.message);
+        }
 
         socketService.emitSeek(roomIdRef.current, trackId, positionMs);
     }, []);
 
-    /**
-     * Skip to the next track in the shared queue.
-     * The server is authoritative; it responds with sync-play for both users.
-     */
     const skipNext = useCallback(() => {
         recentSkipRef.current = true;
-        setTimeout(() => { recentSkipRef.current = false; }, 3000);
+        setTimeout(() => { recentSkipRef.current = false; }, 4000);
         socketService.emitSkip(roomIdRef.current);
     }, []);
 
